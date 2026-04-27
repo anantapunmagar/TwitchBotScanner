@@ -1,4 +1,4 @@
-# TwitchBotScan 🔍
+# TwitchBotScanner 🔍
 
 View-bot detection & stream authenticity analyzer.
 Built with React + Vite, deployed on Vercel, powered by **Groq** (free AI API).
