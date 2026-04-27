@@ -1,389 +1,328 @@
+// api/analyze.js
+// Twitch Bot Scanner - Robust version with graceful degradation
+
 import Groq from "groq-sdk";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-async function fetchWithAuth(url, headers) {
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Twitch API error ${res.status}: ${err}`);
+const RATE_LIMIT_MS = 20_000; // 1 request per 20s per IP
+const rateMap = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const last = rateMap.get(ip) || 0;
+  if (now - last < RATE_LIMIT_MS) return true;
+  rateMap.set(ip, now);
+
+  // Cleanup old entries
+  if (rateMap.size > 600) {
+    for (const [k, v] of rateMap) {
+      if (now - v > RATE_LIMIT_MS * 10) rateMap.delete(k);
+    }
   }
-  return res.json();
+  return false;
 }
 
-async function getTwitchToken() {
+async function getAppAccessToken() {
+  const clientId = process.env.TWITCH_CLIENT_ID;
+  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing TWITCH_CLIENT_ID or TWITCH_CLIENT_SECRET");
+  }
+
   const res = await fetch(
-    `https://id.twitch.tv/oauth2/token?client_id=${process.env.TWITCH_CLIENT_ID}&client_secret=${process.env.TWITCH_CLIENT_SECRET}&grant_type=client_credentials`,
+    `https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
     { method: "POST" }
   );
+
+  if (!res.ok) throw new Error(`Token request failed: ${res.status}`);
   const data = await res.json();
   return data.access_token;
 }
 
+async function fetchTwitch(url, token) {
+  const res = await fetch(url, {
+    headers: {
+      "Client-ID": process.env.TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Twitch API ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+function calculateEntropy(str) {
+  const freq = {};
+  for (const char of str) {
+    freq[char] = (freq[char] || 0) + 1;
+  }
+  let entropy = 0;
+  const len = str.length;
+  for (const count of Object.values(freq)) {
+    const p = count / len;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
 function analyzeUsernames(chatters) {
-  if (!chatters || chatters.length === 0) return { score: 0, flagged: [], patterns: [] };
+  if (!chatters || chatters.length === 0) {
+    return { score: 0, flagged: [], patterns: [], total: 0 };
+  }
 
   const botPatterns = [
-    /^[a-z]+\d{6,}$/i,           // name followed by 6+ digits
-    /^[a-z]{2,4}_[a-z]{2,4}_\d+$/i, // word_word_numbers
-    /^user\d+$/i,                 // user12345
-    /^[a-z]\d{7,}$/i,             // single letter + many digits
-    /^\d+[a-z]+\d+$/i,            // numbers-letters-numbers
-    /^[a-z]{8,12}\d{4,}$/i,       // random chars + numbers
-    /^(bot|viewer|follower|twitch)\d+/i, // bot/viewer prefix
-    /^[a-z]{1,3}\d{5,}$/i,        // very short name + digits
+    /^[a-z]+\d{6,}$/i,
+    /^[a-z]{2,4}_\w+\d+$/i,
+    /^user\d+$/i,
+    /^[a-z]\d{7,}$/i,
+    /^\d+[a-z]+\d+$/i,
+    /^[a-z]{8,12}\d{4,}$/i,
+    /^(bot|viewer|twitch|live|stream)\d+/i,
   ];
 
   const flagged = [];
   const patternCounts = {};
 
   chatters.forEach((chatter) => {
-    const login = chatter.user_login || chatter;
-    let isSuspicious = false;
+    const login = (chatter.user_login || chatter.login || chatter).toLowerCase();
+    let suspicious = false;
 
     botPatterns.forEach((pattern, idx) => {
       if (pattern.test(login)) {
-        isSuspicious = true;
+        suspicious = true;
         patternCounts[idx] = (patternCounts[idx] || 0) + 1;
       }
     });
 
-    // Entropy check — random-looking names
-    const entropy = calculateEntropy(login);
-    if (entropy > 3.8 && login.length > 10) {
-      isSuspicious = true;
-      patternCounts["high_entropy"] = (patternCounts["high_entropy"] || 0) + 1;
+    // High entropy = random-looking name
+    if (login.length >= 10 && calculateEntropy(login) > 3.7) {
+      suspicious = true;
+      patternCounts.high_entropy = (patternCounts.high_entropy || 0) + 1;
     }
 
-    if (isSuspicious) flagged.push(login);
+    if (suspicious) flagged.push(login);
   });
 
-  const score = Math.min(100, Math.round((flagged.length / chatters.length) * 100));
+  const score = Math.min(100, Math.round((flagged.length / chatters.length) * 120)); // slightly aggressive
 
   const patterns = [];
-  if (patternCounts[0]) patterns.push(`${patternCounts[0]} usernames match name+digits pattern`);
-  if (patternCounts["high_entropy"]) patterns.push(`${patternCounts["high_entropy"]} high-entropy random-looking usernames`);
-  if (patternCounts[6]) patterns.push(`${patternCounts[6]} usernames with bot/viewer prefix`);
-
-  return { score, flagged: flagged.slice(0, 50), patterns, total: chatters.length };
-}
-
-function calculateEntropy(str) {
-  const freq = {};
-  for (const c of str) freq[c] = (freq[c] || 0) + 1;
-  const len = str.length;
-  return Object.values(freq).reduce((h, count) => {
-    const p = count / len;
-    return h - p * Math.log2(p);
-  }, 0);
-}
-
-function analyzeFollowerGrowth(followers) {
-  if (!followers || followers.length === 0) return { spikeSuspicious: false, recentFollowRate: 0, clusterScore: 0 };
-
-  const now = Date.now();
-  const last24h = followers.filter(f => (now - new Date(f.followed_at).getTime()) < 86400000);
-  const last1h = followers.filter(f => (now - new Date(f.followed_at).getTime()) < 3600000);
-
-  // Check for clustering — bot farms follow in bursts
-  const timestamps = followers.map(f => new Date(f.followed_at).getTime()).sort();
-  let maxCluster = 0;
-  let clusterCount = 0;
-
-  for (let i = 1; i < timestamps.length; i++) {
-    if (timestamps[i] - timestamps[i - 1] < 2000) { // within 2 seconds
-      clusterCount++;
-      maxCluster = Math.max(maxCluster, clusterCount);
-    } else {
-      clusterCount = 0;
-    }
-  }
-
-  const clusterScore = Math.min(100, maxCluster * 5);
-  const spikeSuspicious = last24h.length > 500 || last1h.length > 100 || clusterScore > 40;
+  if (patternCounts[0]) patterns.push(`${patternCounts[0]} name+long_digits`);
+  if (patternCounts.high_entropy) patterns.push(`${patternCounts.high_entropy]} high-entropy names`);
+  if (patternCounts[6]) patterns.push(`${patternCounts[6]} bot/viewer prefixes`);
 
   return {
-    spikeSuspicious,
-    last24hFollows: last24h.length,
-    last1hFollows: last1h.length,
-    clusterScore,
-    recentFollowRate: last24h.length,
+    score,
+    flagged: flagged.slice(0, 30),
+    patterns,
+    total: chatters.length,
   };
 }
 
 function buildPrompt(realData) {
-  return `You are a professional Twitch fraud analyst. Analyze ONLY the real data provided below. Do NOT invent or hallucinate any numbers. If a field is -1 or null, mark it as unavailable.
+  return `You are an expert Twitch stream authenticity analyst.
 
-REAL DATA FROM TWITCH API:
+Use ONLY the REAL data provided below. Never hallucinate numbers or usernames.
+
 ${JSON.stringify(realData, null, 2)}
 
-Based ONLY on this real data, provide a bot/fraud analysis in this exact JSON format:
+Return ONLY valid JSON matching this schema exactly:
 
 {
-  "riskScore": <0-100 integer based purely on the signals above>,
-  "riskLevel": "<low|medium|high|critical>",
-  "summary": "<2-3 sentence executive summary of findings>",
+  "riskScore": <integer 0-100>,
+  "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+  "summary": "<2-4 sentence professional forensic summary>",
   "signals": [
-    {
-      "type": "<danger|warn|info|safe>",
-      "label": "<signal name>",
-      "detail": "<specific detail referencing real numbers from the data>"
-    }
+    { "type": "safe"|"warn"|"danger", "label": "<short title>", "detail": "<specific explanation with real numbers>" }
   ],
   "metricsBreakdown": {
-    "viewerToFollowerRatio": "<ratio and what it indicates>",
-    "usernameEntropyRisk": "<assessment based on real username analysis>",
-    "followerGrowthRisk": "<assessment based on real follower data>",
-    "accountAgeRisk": "<assessment based on real account age>",
-    "chatEngagementRisk": "<assessment based on real chatter count vs viewers>"
+    "viewerFollowerRatio": "<assessment>",
+    "usernameRisk": "<assessment>",
+    "followerGrowthRisk": "<assessment>",
+    "chatEngagementRisk": "<assessment>",
+    "accountAgeRisk": "<assessment>"
   },
-  "recommendations": [
-    "<specific actionable recommendation based on findings>"
-  ],
-  "confidence": "<low|medium|high — based on how much real data was available>"
+  "recommendations": ["<actionable item>", ...],
+  "confidence": "high" | "medium" | "low"
 }
 
-SCORING GUIDE (use these weights):
-- Username entropy score > 40%: +30 to riskScore
-- Follower cluster score > 40: +25 to riskScore  
-- Viewer/follower ratio < 0.5%: +20 to riskScore
-- Account created < 30 days ago: +15 to riskScore
-- Chatters < 10% of viewers: +20 to riskScore
-- Sudden follower spike (>500 in 24h): +25 to riskScore
-- All signals clean: riskScore should be < 20
+Scoring guidelines (apply strictly):
+- Suspicious usernames > 40% → strong risk increase
+- Viewer/follower ratio < 0.5% while live → high risk
+- New account (<60 days) + high viewers → high risk
+- Follower spike or clustering → high risk
+- Good custom emotes + reasonable engagement → risk reduction
 
-Return ONLY valid JSON. No markdown, no explanation outside the JSON.`;
+Return ONLY the JSON object.`;
 }
 
 export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { channelName } = req.body;
-  if (!channelName) return res.status(400).json({ error: "Channel name required" });
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || "unknown";
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: "Rate limited. Wait 20 seconds between scans." });
+  }
+
+  const { channelName } = req.body || {};
+  if (!channelName || typeof channelName !== "string" || channelName.length > 50) {
+    return res.status(400).json({ error: "Invalid channel name" });
+  }
+
+  const cleanChannel = channelName.trim().toLowerCase().replace(/[^a-z0-9_]/g, "");
 
   try {
-    // Step 1: Get OAuth token
-    const token = await getTwitchToken();
-    const headers = {
-      "Client-ID": process.env.TWITCH_CLIENT_ID,
-      Authorization: `Bearer ${token}`,
-    };
+    const token = await getAppAccessToken();
 
-    // Step 2: Get user info
-    const userData = await fetchWithAuth(
-      `https://api.twitch.tv/helix/users?login=${channelName}`,
-      headers
+    // 1. Get user
+    const userData = await fetchTwitch(
+      `https://api.twitch.tv/helix/users?login=${cleanChannel}`,
+      token
+    );
+    const user = userData.data?.[0];
+    if (!user) return res.status(404).json({ error: "Channel not found" });
+
+    const broadcasterId = user.id;
+    const accountAgeDays = Math.floor(
+      (Date.now() - new Date(user.created_at).getTime()) / (1000 * 60 * 60 * 24)
     );
 
-    if (!userData.data || userData.data.length === 0) {
-      return res.status(404).json({ error: "Channel not found" });
-    }
-
-    const user = userData.data[0];
-    const broadcasterId = user.id;
-    const accountCreatedAt = user.created_at;
-    const accountAgeDays = Math.floor((Date.now() - new Date(accountCreatedAt).getTime()) / 86400000);
-
-    // Step 3: Get stream info
-    let streamData = null;
+    // 2. Stream info
     let isLive = false;
     let viewerCount = 0;
-    let gameName = "N/A";
-    let streamTitle = "N/A";
+    let gameName = "Offline";
+    let streamTitle = "";
 
     try {
-      const streamRes = await fetchWithAuth(
+      const streamRes = await fetchTwitch(
         `https://api.twitch.tv/helix/streams?user_id=${broadcasterId}`,
-        headers
+        token
       );
-      if (streamRes.data && streamRes.data.length > 0) {
-        streamData = streamRes.data[0];
+      const stream = streamRes.data?.[0];
+      if (stream) {
         isLive = true;
-        viewerCount = streamData.viewer_count;
-        gameName = streamData.game_name;
-        streamTitle = streamData.title;
+        viewerCount = stream.viewer_count || 0;
+        gameName = stream.game_name || "Unknown";
+        streamTitle = stream.title || "";
       }
     } catch (e) {
-      console.log("Stream fetch failed:", e.message);
+      console.warn("Stream fetch failed:", e.message);
     }
 
-    // Step 4: Get follower count + recent followers
+    // 3. Followers count (public)
     let followerCount = 0;
-    let recentFollowers = [];
-    let followerGrowthAnalysis = { spikeSuspicious: false, last24hFollows: 0, clusterScore: 0 };
+    let followerGrowth = { last24h: 0, clusterScore: 0, spikeSuspicious: false };
 
     try {
-      const followerRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${broadcasterId}&first=100`,
-        headers
+      const followersRes = await fetchTwitch(
+        `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${broadcasterId}&first=1`,
+        token
       );
-      followerCount = followerRes.total || 0;
-      recentFollowers = followerRes.data || [];
-      followerGrowthAnalysis = analyzeFollowerGrowth(recentFollowers);
+      followerCount = followersRes.total || 0;
     } catch (e) {
-      console.log("Followers fetch failed:", e.message);
+      console.warn("Followers count failed:", e.message);
     }
 
-    // Step 5: Get real chatters list
-    let chattersData = { total: -1, flagged: [], score: 0, patterns: [] };
+    // 4. Chatters (requires moderator:read:chatters scope — will usually fail with app token)
+    let chattersData = { score: 0, flagged: [], patterns: [], total: -1 };
     let rawChattersCount = -1;
 
     try {
-      const chattersRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/chat/chatters?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}&first=1000`,
-        headers
+      const chattersRes = await fetchTwitch(
+        `https://api.twitch.tv/helix/chat/chatters?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}&first=100`,
+        token
       );
       rawChattersCount = chattersRes.total || chattersRes.data?.length || 0;
       chattersData = analyzeUsernames(chattersRes.data || []);
       chattersData.total = rawChattersCount;
     } catch (e) {
-      console.log("Chatters fetch failed (requires mod scope):", e.message);
+      console.warn(`Chatters fetch failed (normal without moderator scope): ${e.message}`);
     }
 
-    // Step 6: Get channel info (description, language, etc.)
-    let channelInfo = {};
-    try {
-      const channelRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/channels?broadcaster_id=${broadcasterId}`,
-        headers
-      );
-      channelInfo = channelRes.data?.[0] || {};
-    } catch (e) {
-      console.log("Channel info fetch failed:", e.message);
-    }
-
-    // Step 7: Get recent clips (engagement signal)
+    // 5. Channel info + emotes
+    let emoteCount = 0;
     let clipCount = 0;
     try {
-      const clipsRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=20`,
-        headers
-      );
-      clipCount = clipsRes.data?.length || 0;
+      const [channelRes, emotesRes, clipsRes] = await Promise.allSettled([
+        fetchTwitch(`https://api.twitch.tv/helix/channels?broadcaster_id=${broadcasterId}`, token),
+        fetchTwitch(`https://api.twitch.tv/helix/chat/emotes?broadcaster_id=${broadcasterId}`, token),
+        fetchTwitch(`https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=10`, token),
+      ]);
+
+      emoteCount = emotesRes.status === "fulfilled" ? (emotesRes.value.data?.length || 0) : 0;
+      clipCount = clipsRes.status === "fulfilled" ? (clipsRes.value.data?.length || 0) : 0;
     } catch (e) {
-      console.log("Clips fetch failed:", e.message);
+      console.warn("Additional data fetch failed:", e.message);
     }
 
-    // Step 8: Get channel emotes (legitimacy signal)
-    let emoteCount = 0;
-    try {
-      const emotesRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/chat/emotes?broadcaster_id=${broadcasterId}`,
-        headers
-      );
-      emoteCount = emotesRes.data?.length || 0;
-    } catch (e) {
-      console.log("Emotes fetch failed:", e.message);
-    }
+    // Derived metrics
+    const viewerFollowerRatio = followerCount > 0 ? ((viewerCount / followerCount) * 100).toFixed(2) : "N/A";
+    const chatterRatio = rawChattersCount > 0 && viewerCount > 0
+      ? ((rawChattersCount / viewerCount) * 100).toFixed(1)
+      : "N/A";
 
-    // Step 9: Get subscriptions count (if affiliate/partner)
-    let subCount = -1;
-    try {
-      const subsRes = await fetchWithAuth(
-        `https://api.twitch.tv/helix/subscriptions?broadcaster_id=${broadcasterId}`,
-        headers
-      );
-      subCount = subsRes.total || -1;
-    } catch (e) {
-      // Requires broadcaster scope — expected to fail
-    }
-
-    // Step 10: Compute derived metrics
-    const viewerToFollowerRatio = followerCount > 0 ? ((viewerCount / followerCount) * 100).toFixed(2) : 0;
-    const chatterToViewerRatio = viewerCount > 0 && rawChattersCount > 0
-      ? ((rawChattersCount / viewerCount) * 100).toFixed(2)
-      : -1;
-
-    // Build real data object for AI
     const realData = {
       channel: {
         login: user.login,
         displayName: user.display_name,
         broadcasterType: user.broadcaster_type || "none",
-        accountCreatedAt,
         accountAgeDays,
-        description: user.description || "",
-        profileImageUrl: user.profile_image_url,
-        viewCount: user.view_count,
-        language: channelInfo.broadcaster_language || "unknown",
-        tags: channelInfo.tags || [],
+        createdAt: user.created_at,
       },
-      stream: {
-        isLive,
-        viewerCount,
-        gameName,
-        streamTitle,
-        startedAt: streamData?.started_at || null,
-      },
-      followers: {
-        total: followerCount,
-        recentSample: recentFollowers.length,
-        last24hFollows: followerGrowthAnalysis.last24hFollows,
-        last1hFollows: followerGrowthAnalysis.last1hFollows || 0,
-        clusterScore: followerGrowthAnalysis.clusterScore,
-        spikeSuspicious: followerGrowthAnalysis.spikeSuspicious,
-      },
+      stream: { isLive, viewerCount, gameName, streamTitle },
+      followers: { total: followerCount, ...followerGrowth },
       chatters: {
-        totalActive: rawChattersCount,
-        analyzedCount: chattersData.total,
-        suspiciousUsernameScore: chattersData.score,
-        flaggedUsernames: chattersData.flagged.slice(0, 20),
-        suspiciousPatterns: chattersData.patterns,
-        chatterToViewerRatioPct: chatterToViewerRatio,
+        total: rawChattersCount,
+        suspiciousScore: chattersData.score,
+        flaggedUsernames: chattersData.flagged,
+        patterns: chattersData.patterns,
+        chatterToViewerRatio: chatterRatio,
       },
       engagement: {
-        viewerToFollowerRatioPct: viewerToFollowerRatio,
-        recentClipCount: clipCount,
-        customEmoteCount: emoteCount,
-        subscriberCount: subCount,
-      },
-      computedRiskSignals: {
-        lowViewerFollowerRatio: parseFloat(viewerToFollowerRatio) < 0.5 && isLive,
-        highUsernameEntropy: chattersData.score > 40,
-        followerSpike: followerGrowthAnalysis.spikeSuspicious,
-        newAccount: accountAgeDays < 30,
-        lowChatterEngagement: chatterToViewerRatio !== -1 && parseFloat(chatterToViewerRatio) < 10,
-        hasCustomEmotes: emoteCount > 0,
-        isAffiliate: user.broadcaster_type === "affiliate",
-        isPartner: user.broadcaster_type === "partner",
+        customEmotes: emoteCount,
+        recentClips: clipCount,
+        viewerFollowerRatioPct: viewerFollowerRatio,
       },
     };
 
-    // Step 11: AI Analysis with real data only
+    // AI Analysis
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
+      temperature: 0.15,
+      max_tokens: 1500,
       messages: [
-        {
-          role: "system",
-          content: "You are a professional Twitch fraud detection analyst. You only analyze real data. You never hallucinate metrics. Return only valid JSON.",
-        },
-        {
-          role: "user",
-          content: buildPrompt(realData),
-        },
+        { role: "system", content: "You are a precise Twitch forensic analyst. Use only the provided real data. Return valid JSON only." },
+        { role: "user", content: buildPrompt(realData) },
       ],
-      temperature: 0.1,
-      max_tokens: 2000,
     });
 
     let aiAnalysis;
     try {
-      const raw = completion.choices[0].message.content.trim();
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      aiAnalysis = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
-    } catch (e) {
+      const rawContent = completion.choices[0]?.message?.content || "{}";
+      const cleaned = rawContent.replace(/```json|```/g, "").trim();
+      aiAnalysis = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.error("AI JSON parse failed:", parseErr);
       aiAnalysis = {
-        riskScore: 50,
-        riskLevel: "medium",
-        summary: "AI analysis parsing failed. Raw data collected successfully.",
+        riskScore: 45,
+        riskLevel: "MEDIUM",
+        summary: "Partial data collected. AI parsing encountered an issue.",
         signals: [],
         metricsBreakdown: {},
-        recommendations: ["Re-run analysis"],
-        confidence: "low",
+        recommendations: ["Re-scan or add moderator permissions for better accuracy"],
+        confidence: "medium",
       };
     }
 
-    // Step 12: Return combined real data + AI analysis
     return res.status(200).json({
       success: true,
       channel: realData.channel,
@@ -391,17 +330,21 @@ export default async function handler(req, res) {
       followers: realData.followers,
       chatters: realData.chatters,
       engagement: realData.engagement,
-      computedRiskSignals: realData.computedRiskSignals,
       analysis: aiAnalysis,
       dataQuality: {
         chattersAvailable: rawChattersCount !== -1,
-        followersAvailable: followerCount > 0,
-        streamDataAvailable: isLive,
-        subsAvailable: subCount !== -1,
+        fullModeration: chattersData.score > 0 && rawChattersCount > 10,
       },
+      note: chattersData.total === -1 
+        ? "Chatters list requires moderator:read:chatters scope (user OAuth token)" 
+        : "Real chat data used",
     });
+
   } catch (error) {
-    console.error("Analysis error:", error);
-    return res.status(500).json({ error: error.message || "Analysis failed" });
+    console.error("Handler error for channel", cleanChannel, ":", error.message);
+    return res.status(500).json({
+      error: "Analysis failed. Please try again in a few seconds.",
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 }
