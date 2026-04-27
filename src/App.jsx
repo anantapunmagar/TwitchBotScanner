@@ -303,7 +303,7 @@ export default function App() {
 
         <div className="header">
           <div className="header-badge">⬡ FORENSIC ANALYSIS TOOL v2.4</div>
-          <h1>TWITCH<br /><span>BOT</span>SCAN</h1>
+          <h1>TWITCH<br /><span>BOT</span>SCANNNER</h1>
           <p>View-bot detection &amp; stream authenticity analyzer</p>
         </div>
 
