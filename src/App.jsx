@@ -295,7 +295,7 @@ export default function App() {
         {/* HEADER */}
         <div className="hdr">
           <div className="hdr-badge">⬡ FORENSIC ANALYSIS SYSTEM v3.0</div>
-          <h1>TWITCH<em>BOT</em>SCAN</h1>
+          <h1>TWITCH<em>BOT</em>SCANNER</h1>
           <p>View-bot detection · Chat authenticity · Stream forensics</p>
         </div>
 
