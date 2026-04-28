@@ -304,7 +304,7 @@ export default function App() {
 
         <div className="header">
           <div className="header-badge">⬡ FORENSIC ANALYSIS TOOL v2.4</div>
-          <h1>TWITCH<br /><span>BOT</span>SCANNER</h1>
+          <h1>TWITCH<br /><span>BOT</span>SCAN</h1>
           <p>View-bot detection &amp; stream authenticity analyzer</p>
         </div>
 
@@ -361,11 +361,11 @@ export default function App() {
                     <span className="dot" />
                     LIVE TWITCH API · {[
                       result.dataQuality?.isLive && "STREAM",
-                      result.dataQuality?.hasChatters && "CHATTERS",
+                      result.dataQuality?.ircSampled && `IRC(${result.dataQuality?.uniqueIrcChatters ?? 0} chatters)`,
                       result.dataQuality?.hasVODs && "VODS",
                       result.dataQuality?.hasClips && "CLIPS",
                       result.dataQuality?.hasSubs && "SUBS",
-                    ].filter(Boolean).join(" · ") || "FOLLOWERS"}
+                    ].filter(Boolean).join(" · ") || "FOLLOWERS + ENTROPY"}
                   </div>
                 )}
               </div>
