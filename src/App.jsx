@@ -171,12 +171,12 @@ const style = `
   .cursor::after { content:'_'; animation:blink 1s step-end infinite; color:var(--accent); }
 `;
 
-const IRC_COLLECT_MS = 60000; // collect chat for 15 seconds
+const IRC_COLLECT_MS = 60000; // collect chat for 60 seconds
 
 const SCAN_STEPS = [
   { label: "Resolving channel identity & account age...", phase: "api" },
   { label: "Fetching live stream & viewer count...", phase: "api" },
-  { label: "Connecting to Twitch IRC — collecting live chat...", phase: "irc" },
+  { label: "Connecting to Twitch IRC — live chat collection (60s)...", phase: "irc" },
   { label: "Sampling real chat messages...", phase: "irc" },
   { label: "Pulling followers & timestamp clustering...", phase: "api" },
   { label: "Running username entropy analysis...", phase: "irc" },
@@ -352,7 +352,7 @@ export default function App() {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: ch, ircData }),
+        body: JSON.stringify({ channel: ch, ircData, collectDurationMs: IRC_COLLECT_MS }),
       });
 
       if (res.status === 429) throw new Error("Too many requests. Wait 30 seconds.");
@@ -603,6 +603,10 @@ export default function App() {
                     color={mb.messageRateAnomaly < 30 ? "green" : mb.messageRateAnomaly < 60 ? "yellow" : "red"} />
                   <BarRow label="Single-Msg Bot Pattern" value={mb.singleMsgSuspicion ?? 0}
                     color={(mb.singleMsgSuspicion ?? 0) < 30 ? "green" : (mb.singleMsgSuspicion ?? 0) < 60 ? "yellow" : "red"} />
+                  <BarRow label="Repeat Message Pattern" value={mb.repeatMsgSuspicion ?? 0}
+                    color={(mb.repeatMsgSuspicion ?? 0) < 30 ? "green" : (mb.repeatMsgSuspicion ?? 0) < 60 ? "yellow" : "red"} />
+                  <BarRow label="Chat Velocity Anomaly" value={mb.lowVarianceSuspicion ?? 0}
+                    color={(mb.lowVarianceSuspicion ?? 0) < 30 ? "green" : (mb.lowVarianceSuspicion ?? 0) < 60 ? "yellow" : "red"} />
                 </div>
                 <div className="panel">
                   <div className="panel-title">Anomaly Signals</div>
@@ -622,13 +626,18 @@ export default function App() {
                       : "⚠ CHANNEL OFFLINE — NO CHAT DATA"}
                   </span>
                 </div>
+                {result.dataQuality?.topRepeatedMsg && (
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, padding: "8px 12px", marginBottom: 10, background: "#1a0a0a", border: "1px solid var(--danger-dim)", color: "var(--danger)" }}>
+                    ⚠ COORDINATED MESSAGE: "{result.dataQuality.topRepeatedMsg.text}" — sent by {result.dataQuality.topRepeatedMsg.count} different accounts
+                  </div>
+                )}
                 {result.chatSample?.length > 0 ? (
                   <div style={{ overflowX: "auto" }}>
                     <table className="chat-table">
                       <thead>
                         <tr>
                           <th>USERNAME</th>
-                          <th>MSGS IN 15s</th>
+                          <th>MSGS IN WINDOW</th>
                           <th>BOT SCORE</th>
                           <th>LAST MESSAGE</th>
                           <th>STATUS</th>
@@ -638,7 +647,7 @@ export default function App() {
                         {result.chatSample.map((u, i) => (
                           <tr key={i}>
                             <td className={`col-${u.status}`}>{u.username}</td>
-                            <td>{u.messagesIn15s}</td>
+                            <td>{u.messagesInWindow ?? u.messagesIn15s ?? 0}</td>
                             <td>
                               <span style={{ color: u.botScore >= 60 ? "var(--danger)" : u.botScore >= 25 ? "var(--warn)" : "var(--accent)" }}>
                                 {u.botScore}/100
