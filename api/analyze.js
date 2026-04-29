@@ -485,6 +485,16 @@ export default async function handler(req, res) {
       followerChatRatio: tw.followerCount > 0
         ? parseFloat(((irc.uniqueChatters / tw.followerCount) * 100).toFixed(4)) : 0,
       avgAccountAgeDays: tw.accountAgeDays,
+      // Channel info — displayed in UI header
+      isLive: tw.isLive,
+      streamTitle: tw.streamTitle,
+      gameName: tw.gameName,
+      streamAgeMinutes: tw.streamAgeMinutes,
+      broadcasterType: tw.broadcasterType,
+      subCount: tw.subCount,
+      modCount: tw.modCount,
+      tags: tw.tags,
+      viewerFollowerRatio,
       // AI text
       verdict,
       signals,
