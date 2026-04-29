@@ -171,7 +171,7 @@ const style = `
   .cursor::after { content:'_'; animation:blink 1s step-end infinite; color:var(--accent); }
 `;
 
-const IRC_COLLECT_MS = 15000; // collect chat for 15 seconds
+const IRC_COLLECT_MS = 60000; // collect chat for 15 seconds
 
 const SCAN_STEPS = [
   { label: "Resolving channel identity & account age...", phase: "api" },
